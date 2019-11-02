@@ -1,0 +1,576 @@
+import os, sys, gzip, time
+import numpy as np
+import logging
+
+cimport numpy as np
+cimport cython
+
+'''
+If 1 two urns in contact for the first time exchange their sons,
+elif 0 they exchange a (weighted) sample of their urn.\
+'''
+DEF PASS_SONS = >>PASS_SONS<<
+
+'''
+If PASS_SONS == 0 => sample extraction:
+    0: pass \nu+1 weightly extracted balls (without replacement, i.e. I do not put the ball back in the urn after every extraction!);
+    1: pass exactly \nu+1 distinct IDs from one urn to the other (again, weighted extraction and without replacement);
+    2: pass exactly \nu+1 distinct IDs with a flatten extraction (i.e. all the IDs have weight 1, regardless of their current status);
+If PASS_SONS == 1 => different son strategy:
+    0: urns exchange their \nu+1 fixed sons;
+    1: urns exchange their \nu+1 last CONTACTED ids. If the urn is at her first event it passes her sons. After the event the called id is added in
+        the caller sequence. If the called's ID is already in the caller \nu+1 sequence it is brought in front of the sequence otherwise the sequence
+        is simply shifted by one position and the called is inserted in front of it.
+    2: same as 1 but also the called's list gets shifted by one position with the insertion of the caller ID (or gets updated if the caller is already there).
+'''
+DEF STRICT_SAMPLE = >>STRICT_SAMPLE<<
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+@cython.overflowcheck(True)
+def Urnes_Evolution(rho=4, nu=2, nFiles=10, Events_per_step=1000000, runIDX=0, **kwargs):
+    '''
+    Function generating the system and letting it evolve.
+
+    Usage:
+    Urnes_Evolution(rho=4, nu=2, nFiles=10, Events_per_step=1000000, runIDX=0, **kwargs)
+
+    **kwargs:
+        'LogLevel': debug, ['info'], 'warning', 'error';
+        't_ini': [1000] initial time of the running analysis and ISR rearrangement;
+        'num_analysis': 40 number of logarithmically spaced times;
+    '''
+
+    cdef:
+        # First the parameters of the simulation...
+        unsigned int Rho = <unsigned int> rho
+        unsigned int Nu = <unsigned int> nu
+
+        unsigned int Steps_Time = <unsigned int> nFiles
+        unsigned int Events_for_Step = <unsigned int> Events_per_step
+        unsigned int DueRho = <unsigned int> 2 * Rho
+        unsigned int Nu_Plus_One = Nu + <unsigned int> 1
+
+        # Then the initial network...
+        list Urnes_IDs = [[<unsigned int>1], [<unsigned int>0]]
+        list Urnes_cps = [[<unsigned int>1], [<unsigned int>1]]
+        list Urnes_size = [<unsigned int>1+Nu_Plus_One,\
+                            <unsigned int>1+Nu_Plus_One]
+        list ID_in_Urn = [set([1]), set([0])]
+        list Neigh = [set(), set()]
+        list Sons = [[], []]
+        list Father = [-1,-1]
+        list Activity = [0, 0]
+
+        unsigned int Tot_Len_Urnes = 2*(1 + Nu_Plus_One)
+        unsigned int Urnes_Number = 2*(1 + Nu_Plus_One)
+
+        # Auxiliary variables...
+        set ids_in_called, ids_in_caller    # Used to refer to the temporary
+                                            # set of ids in the exchange sons
+                                            # procedure.
+
+        list tmp_cps, tmp_ids   # Used to temporarily refer to the
+                                # ids and their cardinality in the
+                                # exchange sample procedure.
+
+        unsigned int id_urna    # Temporary references and variables to the urn ID
+        set unique_fathers      # in the dynamical analysis
+        double fathers_deg, free_deg, sons_deg, fathers_connected
+        double average_deg, temp_deg
+        int padre, num_of_free, num_of_sons, num_of_fathers
+        int num_of_full_sons, num_of_full_free, num_of_filled_urnes
+
+    # Filling the systems with the sons' urns...
+    for i in range(2*Nu_Plus_One):
+        Urnes_IDs.append([])
+        Urnes_cps.append([])
+        Urnes_size.append(0)
+        ID_in_Urn.append(set())
+        Neigh.append(set())
+        Sons.append([])
+        Activity.append(0)
+
+    for i in range(Nu_Plus_One):
+        Sons[0].append(<unsigned int> (2+i))
+        ID_in_Urn[0].add(<unsigned int> (2+i))
+        Urnes_IDs[0].append(<unsigned int> (2+i))
+        Urnes_cps[0].append(1)
+
+        Sons[1].append(<unsigned int> (2+i+Nu_Plus_One))
+        ID_in_Urn[1].add(<unsigned int> (2+i+Nu_Plus_One))
+        Urnes_IDs[1].append(<unsigned int> (2+i+Nu_Plus_One))
+        Urnes_cps[1].append(1)
+
+    Father.extend([0]*Nu_Plus_One)
+    Father.extend([1]*Nu_Plus_One)
+
+    # IO stuff...
+    ODir = '../data/'
+    ODir += 'Symm_'
+    ODir += 'SonsExchg%d_' % PASS_SONS
+    ODir += 'StrctSmpl%d_' % STRICT_SAMPLE
+
+    ODir += 'r%02d_n%02d_t%012d_Run_' %\
+            (Rho, Nu, Steps_Time*Events_for_Step)
+
+    Run_index = runIDX
+    ODir = ODir + "%02d" % Run_index
+    if os.path.exists(ODir):
+        from shutil import rmtree
+        logging.info("Found an old folder of an uncomplete run: %s removing it..." % ODir)
+        rmtree(ODir)
+        #raise RuntimeError, "folder %s%s exists!" %(ODir, "%02d" % Run_index)
+    os.mkdir(ODir)
+
+    LogFile = ODir + "_logfile.log"
+    if os.path.exists(LogFile):
+        print "Found an old Log file, %s, removing it..." % LogFile
+        os.remove(LogFile)
+
+    LogLevel = logging.INFO
+    if 'LogLevel' in kwargs:
+        if "debug" in kwargs["LogLevel"].lower():
+            LogLevel = logging.DEBUG
+        elif "info" in kwargs["LogLevel"].lower():
+            LogLevel = logging.INFO
+        elif "warning" in kwargs["LogLevel"].lower():
+            LogLevel = logging.WARNING
+        elif "error" in kwargs["LogLevel"].lower():
+            LogLevel = logging.ERROR
+        elif "critical" in kwargs["LogLevel"].lower():
+            LogLevel = logging.CRITICAL
+    logging.shutdown()
+    reload(logging)
+    logging.basicConfig(filename=LogFile, level=LogLevel)
+
+    ConnFile = ODir + "_connections.dat"
+    if os.path.exists(ConnFile):
+        logging.info("Found an old connections file, %s, removing it..." % ConnFile)
+        os.remove(ConnFile)
+
+    n_t_steps = int(kwargs.get('num_analysis', "40"))
+    t_ini = float(kwargs.get("t_ini", "1e+3"))
+    t_fin = Events_for_Step*Steps_Time
+
+    TVec = np.ceil(np.logspace(np.log10(max(1., min(t_fin-2, t_ini-1))),\
+                    np.log10(max(2., t_fin)), n_t_steps))
+    TVec[len(TVec)-1] = max(2, t_fin)
+
+    logging.info('\n#############\nParameters:\n\tRho = %d\n\tNu = %d\n\tEv_per_step = %d\n\tFile_num = %d\n################\nTime of analysis: %s\n\n',\
+            Rho, Nu, Events_for_Step, Steps_Time, " ".join(['%e'%t for t in TVec]))
+
+    cdef:
+        # Auxiliary variables...
+        unsigned int caller = 0 # The indexes of caller and called in the ISR array
+        unsigned int called = 0
+        unsigned int caller_indx = 0    # The position index of caller in the
+        unsigned int called_indx = 0    #  called's urn and vice-versa...
+
+        unsigned int ev = 0             # Event counter.
+        list Caller_v = [<unsigned int> 0]*Events_for_Step # Containers for the events
+        list Called_v = [<unsigned int> 0]*Events_for_Step
+        list Rho_range = [<unsigned int> i for i in range(Rho)]
+        list Nu_range = [<unsigned int> i for i in range(Nu_Plus_One)]
+
+        list ISR = [<unsigned int> i for i in range(Urnes_Number)]  # The vector storing the index reversely sorted for urn size...
+
+        unsigned int s = 0          # Reference for the son index in the sons exchanging.
+        unsigned int extracted = 0  # Reference for the temp index in the extraction.
+        unsigned int counter = 0    # Cumulative count of extraction.
+        unsigned int remainder = 0  # Difference = Cumulative - extracted
+        unsigned int c = 0          # Temporal ID for the calle* indexes in Urnes_IDs
+
+        bint Exchange_Sons = False  # Running time flags to trigger sons exchange
+        bint Father_To_Son = False  # and the limiting increment if sons call fathers.
+
+        list CLR_Sample = [0]*Nu_Plus_One # The containers for the urns samples...
+        list CLD_Sample = [0]*Nu_Plus_One
+
+        unsigned int urn_size_temp = 0                  # Temporal values referring to the
+        unsigned int urn_sample_temp, urn_id_index_tmp  # urn being filled...
+
+        list Called_Urn_cps # Temporal list of elements to pass from one urn to the other
+        list ids_to_add     # and the reference to the values of the copies in a urn...
+
+
+    # Logging the initial situation...
+    logging.info("INITIAL SITUATION:\n\tUrnes_IDs: %s\n\tUrnes_cps: %s\n\tUrnes_size: %s\n\tIds_in_Urn: %s\n\tNeighbs: %s\n\tFathers: %s\n\tActivity: %s\n\tISR: %s\n\tTotLenUrns: %d\n\tUrnes_Num: %d\n\tSaving in Folder: %s\n\tConnection File: %s\n\tLog File: %s\n\t",\
+            " | ".join([" ".join(["%d"%j for j in i]) for i in Urnes_IDs]),\
+            " | ".join([" ".join(["%d"%j for j in i]) for i in Urnes_cps]),\
+            " | ".join(["%d" % i for i in Urnes_size]),\
+            " | ".join([" ".join(["%d"%j for j in i]) for i in ID_in_Urn]),\
+            " | ".join([" ".join(["%d"%j for j in i]) for i in Neigh]),\
+            " | ".join(["%d" % i for i in Father]),\
+            " | ".join(["%d" % i for i in Activity]),\
+            " | ".join(["%d" % i for i in ISR]),\
+            Tot_Len_Urnes, Urnes_Number, ODir, ConnFile, LogFile,)
+
+    ###################
+    # Counter of the times I checked the code up to this point
+    # I I I I I I I I
+    ###################
+
+    # Then the actual evolution...
+    cdef:
+        Events_Counter = 0
+
+    for t in range(Steps_Time): # For over the out files...
+        for ev in xrange(Events_for_Step): # For over the events in a single file...
+            Events_Counter += 1
+            extracted = np.random.randint(Tot_Len_Urnes) + 1
+            #logging.debug("\nNew Cycle:\nTot_Len_Urnes: %d - Extracted: %d\nUrns:\n", Tot_Len_Urnes, extracted)
+
+            # Counting the cumulative number of balls seen up to extracted...
+            counter = 0
+            for caller in ISR:
+                counter += Urnes_size[caller]
+                #logging.debug("caller - Urnes_size[caller]: %d - %d\n", caller, Urnes_size[caller])
+                if extracted <= counter:
+                    break
+            logging.debug("counter: %d", counter)
+
+            # The remainder already tells us the ball to draw within caller's urn...
+            remainder = (Urnes_size[caller] + extracted) - counter
+            Called_Urn_cps = Urnes_cps[caller]
+            counter = Called_Urn_cps[0]
+            called_indx = 0
+            logging.debug("Remainder: %d - counter %d\n", remainder, counter)
+
+            # Having already set the counter to the first urn id in the caller's urn
+            # I now cycle up to the remainder...
+            while remainder > counter:
+                called_indx += 1
+                counter += Called_Urn_cps[called_indx]
+                #logging.debug("counter: %d - called_indx %d - Urns_cps[caller][called_indx] %d\n",\
+                #        counter, called_indx, Urnes_cps[caller][called_indx])
+            called = Urnes_IDs[caller][called_indx]
+            Caller_v[ev] = caller
+            Called_v[ev] = called
+            logging.debug("called: %d", called)
+            logging.debug("Caller, called: %d - %d\n", caller, called)
+
+            # Here we check the sons of the called and,
+            # if none sons we set them...
+            if len(Sons[called]) == 0:
+                logging.debug("Adding sons to called: %d\n", called)\
+                # Creating the ids to add as sons...
+                ids_to_add = [(Urnes_Number + Index) for Index in Nu_range]
+
+                # Populating the called variables...
+                Urnes_IDs[called].extend(ids_to_add)
+                Urnes_cps[called].extend([<unsigned int> 1]*Nu_Plus_One)
+                Urnes_size[called] += Nu_Plus_One
+                ID_in_Urn[called].update(ids_to_add)
+                Sons[called].extend(ids_to_add)
+
+                # Updating the system variables...
+                Tot_Len_Urnes += Nu_Plus_One
+                Urnes_Number += Nu_Plus_One
+                ISR.extend(ids_to_add)
+
+                # Appending the lists, sets and uints for the newly created sons...
+                Urnes_IDs.extend([[] for Index in Nu_range])
+                Urnes_cps.extend([[] for Index in Nu_range])
+                Urnes_size.extend([<unsigned int> 0]*Nu_Plus_One)
+                ID_in_Urn.extend([set() for Index in Nu_range])
+                Neigh.extend([set() for Index in Nu_range])
+                Sons.extend([[] for Index in Nu_range])
+                Father.extend([called for Index in Nu_range])
+                Activity.extend([<unsigned int> 0]*Nu_Plus_One)
+
+            # Here we update the called actor: we first check the index of the caller
+            # the called urns and then increment its counter and set the Exchange_Sons
+            # flag...
+            Exchange_Sons = False
+            caller_indx = 0
+            for c in Urnes_IDs[called]:
+                if c == caller:
+                    Urnes_cps[called][caller_indx] += Rho
+                    if called not in Neigh[caller]:
+                        Exchange_Sons = True
+                    break
+                caller_indx += 1
+            else:
+                Urnes_IDs[called].append(caller)
+                Urnes_cps[called].append(Rho)
+                ID_in_Urn[called].add(caller)
+                Exchange_Sons = True
+            Urnes_size[called] += Rho
+
+            # Here we do the same for the caller actor...
+            Urnes_cps[caller][called_indx] += Rho
+            Urnes_size[caller] += Rho
+            Activity[caller] += 1
+
+            # The increment, together, done by the caller and the called reinforcement...
+            Tot_Len_Urnes += DueRho
+
+            # Now exchanging sons...
+            if Exchange_Sons:
+                # Update the neighborhood of both the actors...
+                Neigh[caller].add(called)
+                Neigh[called].add(caller)
+
+                IF PASS_SONS == 1: # CASE where I pass the sons...
+                    # For over the called's sons: if I find the caller ID then I have to
+                    # set the Father_To_Son flag to True. If the son is already in the
+                    # caller's urn I have to update its counter, otherwise I have to append
+                    # a new value.
+                    Father_To_Son = False
+                    ids_in_caller = ID_in_Urn[caller] # Quick reference to the ID_in_urn
+                    for s in Sons[called]:
+                        if s != caller:
+                            if s not in ids_in_caller:
+                                Urnes_IDs[caller].append(s)
+                                Urnes_cps[caller].append(<unsigned int>1)
+                                ID_in_Urn[caller].add(s)
+                            else:
+                                Urnes_cps[caller][Urnes_IDs[caller].index(s)] += 1
+                        else:
+                            Father_To_Son = True
+
+                    IF STRICT_SAMPLE == 2: # Update the called sons only in the 2 option.
+                        if Father_To_Son: # I already know if caller in sons of called.
+                            caller_indx = Sons[called].index(caller)
+                        else:
+                            caller_indx = Nu # As if it was the last one...
+
+                        Sons[called][1:caller_indx+1] = Sons[called][:caller_indx]
+                        Sons[called][0] = caller
+
+
+                    # Dependent increment of the local and global variables...
+                    if Father_To_Son:
+                        Urnes_size[caller] += Nu
+                        Tot_Len_Urnes += Nu
+                    else:
+                        Urnes_size[caller] += Nu_Plus_One
+                        Tot_Len_Urnes += Nu_Plus_One
+
+                    # Then the same for called...
+                    Father_To_Son = False
+                    ids_in_called = ID_in_Urn[called]
+                    for s in Sons[caller]:
+                        if s != called:
+                            if s not in ids_in_called:
+                                Urnes_IDs[called].append(s)
+                                Urnes_cps[called].append(<unsigned int>1)
+                                ID_in_Urn[called].add(s)
+                            else:
+                                Urnes_cps[called][Urnes_IDs[called].index(s)] += 1
+                        else:
+                            Father_To_Son = True
+                    IF 1 <= STRICT_SAMPLE <= 2:
+                        if Father_To_Son:
+                            called_indx = Sons[caller].index(called)
+                        else:
+                            called_indx = Nu # As if it was the last one...
+                        Sons[caller][1:called_indx+1] = Sons[caller][:called_indx]
+                        Sons[caller][0] = called
+
+                    if Father_To_Son:
+                        Urnes_size[called] += Nu
+                        Tot_Len_Urnes += Nu
+                    else:
+                        Urnes_size[called] += Nu_Plus_One
+                        Tot_Len_Urnes += Nu_Plus_One
+                ############
+                # Counter of the times I checked the sons exchange part...
+                # I I I I I I I I I I I
+                ############
+                #### END of the exchange sons == 1 case
+                ELIF PASS_SONS == 0: # HERE I pass from one urn to the other a sample of their content
+                    # I have to extract the sample BEFORE updating the two urns!
+
+                    # Sampling caller's urn...
+                    # Saving the size of the caller's urn..
+                    urn_size_temp = Urnes_size[caller]
+
+                    IF STRICT_SAMPLE == 0:
+                        # Make a copy of the balls copies in the urn...
+                        tmp_cps = [s for s in Urnes_cps[caller]]
+                    ELIF STRICT_SAMPLE == 1:
+                        # Set the indexes to -1 to annotate the extracted IDs and copies the number of copies...
+                        for s in Nu_range:
+                            CLR_Sample[s] = -1
+                        tmp_cps = [s for s in Urnes_cps[caller]]
+                    ELIF STRICT_SAMPLE == 2:
+                        # We don't need to set the indexes to -1 as we can extract each ball only once as we set the weight to 1 for everyone...
+                        tmp_cps = [1 for s in Urnes_cps[caller]]
+                        # However we need to set urn_size_temp to len(tmp_cps) as we are using ones as weights...
+                        urn_size_temp = len(tmp_cps)
+
+                    tmp_ids = Urnes_IDs[caller]
+                    for s in Nu_range:
+                        # Fixing the extraction condition and cycling over the copies and IDs contained in the urn...
+                        urn_sample_temp = called
+                        while True:
+                            extracted = np.random.randint(urn_size_temp) + 1
+                            urn_id_index_tmp = 0
+                            counter = tmp_cps[urn_id_index_tmp]
+                            while extracted > counter:
+                                urn_id_index_tmp += 1
+                                counter += tmp_cps[urn_id_index_tmp]
+
+                            # When done, save the extracted ID in the corresponding position of the urn sample.
+                            urn_sample_temp = tmp_ids[urn_id_index_tmp]
+
+                            IF STRICT_SAMPLE == 1:
+                                if (urn_sample_temp != called) and (urn_sample_temp not in CLR_Sample): # i.e. is not called and it's the first occurrence...
+                                    break
+                            ELSE:
+                                if (urn_sample_temp != called):
+                                    break
+
+                        CLR_Sample[s] = urn_sample_temp
+                        # Now that we extracted the id and the ball let us decrease the urn_size_temp and the copies counter of the ID...
+                        urn_size_temp -= 1
+                        tmp_cps[urn_id_index_tmp] -= 1
+
+                    ##########################################################
+                    # Now the same for the called's urn...
+                    urn_size_temp = Urnes_size[called]
+                    IF STRICT_SAMPLE == 0:
+                        tmp_cps = [s for s in Urnes_cps[called]]
+                    ELIF STRICT_SAMPLE == 1:
+                        for s in Nu_range:
+                            CLD_Sample[s] = -1
+                        tmp_cps = [s for s in Urnes_cps[called]]
+                    ELIF STRICT_SAMPLE == 2:
+                        tmp_cps = [1 for s in Urnes_cps[called]]
+                        urn_size_temp = len(tmp_cps)
+                    tmp_ids = Urnes_IDs[called]
+                    for s in Nu_range:
+                        urn_sample_temp = caller
+                        while True:
+                            extracted = np.random.randint(urn_size_temp) + 1
+                            urn_id_index_tmp = 0
+                            counter = tmp_cps[urn_id_index_tmp]
+                            while extracted > counter:
+                                urn_id_index_tmp += 1
+                                counter += tmp_cps[urn_id_index_tmp]
+                            urn_sample_temp = tmp_ids[urn_id_index_tmp]
+                            IF STRICT_SAMPLE == 1:
+                                if (urn_sample_temp != caller) and (urn_sample_temp not in CLD_Sample):
+                                    break
+                            ELSE:
+                                if (urn_sample_temp != caller):
+                                    break
+                        CLD_Sample[s] = urn_sample_temp
+                        urn_size_temp -= 1
+                        tmp_cps[urn_id_index_tmp] -= 1
+                    ##########################################################
+
+                    # Now update the caller's urn with the copies coming from called...
+                    # Here I left the ID_in_Urn reference as I have to check if cYthon respects the reference (I could add twice the same
+                    # ID when using the non-strict sampling and still check the presence of the ID in the old copy of ID_in_Urn)...
+                    for s in CLD_Sample:
+                        if s not in ID_in_Urn[caller]:
+                            Urnes_IDs[caller].append(s)
+                            Urnes_cps[caller].append(<unsigned int>1)
+                            ID_in_Urn[caller].add(s)
+                        else:
+                            Urnes_cps[caller][Urnes_IDs[caller].index(s)] += 1
+                    Urnes_size[caller] += Nu_Plus_One
+                    Tot_Len_Urnes += Nu_Plus_One
+
+                    # and the same for the called one...
+                    for s in CLR_Sample:
+                        if s not in ID_in_Urn[called]:
+                            Urnes_IDs[called].append(s)
+                            Urnes_cps[called].append(<unsigned int>1)
+                            ID_in_Urn[called].add(s)
+                        else:
+                            Urnes_cps[called][Urnes_IDs[called].index(s)] += 1
+
+                    Urnes_size[called] += Nu_Plus_One
+                    Tot_Len_Urnes += Nu_Plus_One
+
+                ############
+                # Counter of the times I checked the urns sample exchange part...
+                # I I I I I I I
+                ############
+                #### END of the exchange sample case
+            #### End of the Exchange_Sons block #####
+            if LogLevel == logging.DEBUG:
+                if len(set(Urnes_IDs[called])) < len(Urnes_IDs[called]):
+                    logging.debug("Ommioddio due ID uguali in called!\n")
+                    logging.debug(" ".join(["%d" % i for i in Urnes_IDs[called]]) + "\n")
+                    logging.debug(" ".join(["%d" % i for i in Urnes_cps[called]]) + "\n")
+
+                if len(set(Urnes_IDs[caller])) < len(Urnes_IDs[caller]):
+                    logging.debug("Ommioddio due ID uguali in caller!\n")
+                    logging.debug(" ".join(["%d" % i for i in Urnes_IDs[caller]]) + "\n")
+                    logging.debug(" ".join(["%d" % i for i in Urnes_cps[caller]]) + "\n")
+
+            if Events_Counter in TVec:
+                #Analysis to do in TVec steps...
+                fathers_deg, fathers_connected, average_deg, sons_deg, free_deg =\
+                        .0,.0,.0,.0,.0
+                num_of_free, num_of_sons = 0,0
+                num_of_filled_urnes, num_of_full_sons, num_of_full_free = 0,0,0
+                num_of_filled_urnes = 0
+
+                for id_urna in xrange(Urnes_Number):
+                    padre = Father[id_urna]
+                    if (padre >= 0):
+                        if (id_urna in Neigh[padre]):
+                            fathers_connected += 1.
+                        sons_deg += <double> len(Neigh[id_urna])
+                        if Urnes_size[id_urna] > 0:
+                            num_of_full_sons += 1
+                            fathers_deg += <double> len(Neigh[padre])
+                    else:
+                        num_of_free += 1
+                        free_deg += <double> len(Neigh[id_urna])
+                        if Urnes_size[id_urna] > 0:
+                            num_of_full_free += 1
+
+                    average_deg += <double> len(Neigh[id_urna])
+
+                    if Urnes_size[id_urna] > 0:
+                        num_of_filled_urnes += 1
+
+                unique_fathers = set([padre for padre in Father if padre>=0])
+
+                num_of_fathers = len(unique_fathers)
+                num_of_sons = (<int> Urnes_Number) - num_of_free
+                # # # fathers_deg /= <double> num_of_fathers
+                # # # average_deg /= <double> num_of_filled_urnes
+                fathers_connected /=\
+                            <double> max(1, num_of_full_sons)
+                sons_deg /= <double> max(1, num_of_full_sons)
+                free_deg /= <double> max(1, num_of_full_free)
+
+
+                f = open(ODir+"_connections.dat", "a")
+                f.write("%.03e\t%.03e\t%.03e\t%.03e\t%.03e\t%.03e\t%.03e\t%.03e\t%.03e\t%.03e\t%.03e\t%.03e\t%.03e\n" %\
+                    (Events_Counter, Urnes_Number, num_of_filled_urnes,\
+                    num_of_fathers, num_of_sons, num_of_full_sons,\
+                    num_of_free, num_of_full_free,\
+                    average_deg, fathers_deg, sons_deg, free_deg, fathers_connected))
+                f.close()
+
+                # Rearranging...
+                ISR = [ID for ID in np.argsort(Urnes_size)[::-1]]
+                logging.info('Step %08d of %08d done at time %s....' %\
+                        (Events_Counter, Events_for_Step*Steps_Time, time.strftime("%H:%M:%S  %d/%m/%Y")))
+
+
+
+        f = gzip.open(os.path.join(ODir, 'time_%06d.dat' % t), 'wb')
+        for clr_id, cld_id in zip(Caller_v, Called_v):
+            f.write('%d\t%d\t1\t1\n' % (clr_id, cld_id))
+        f.close()
+
+        # End of cycle over in-file events...
+    # End of cycle over files...
+
+    logging.info("\n\n")
+    logging.info("Sequence files saved in %s\n" % ODir)
+    logging.shutdown()
+    reload(logging)
+    return 0
+

@@ -1,0 +1,154 @@
+
+xaxes scale logarithmic
+yaxes scale logarithmic
+
+xaxis label "t [ev]"
+yaxis label "Val(t)"
+
+READ NXY "../data/Symm_Reinforce1_r04_n02_t000010000000_Run_00_connections.dat"
+
+s0 linestyle 0
+s0 symbol 2
+s0 symbol color 1
+s0 legend "urns_num"
+
+s1 linestyle 0
+s1 symbol 1
+s1 symbol color 1
+s1 legend "num_of_full_urns"
+
+s2 linestyle 0
+s2 symbol 3
+s2 symbol color 2
+s2 legend "num_of_fath"
+
+s3 linestyle 0
+s3 symbol 3
+s3 symbol color 3
+s3 legend "num_of_sons"
+
+s4 linestyle 0
+s4 symbol 4
+s4 symbol color 4
+s4 legend "num_of_full_sons"
+
+s5 linestyle 0
+s5 symbol 1
+s5 symbol color 9
+s5 legend "num_of_free"
+
+s6 linestyle 0
+s6 symbol 2
+s6 symbol color 9
+s6 legend "num_of_full_free"
+
+s7 linestyle 0
+s7 symbol 1
+s7 symbol color 8
+s7 legend "ave_deg"
+
+s8 linestyle 0
+s8 symbol 4
+s8 symbol color 2
+s8 legend "fath_deg"
+
+s9 linestyle 0
+s9 symbol 7
+s9 symbol color 3
+s9 legend "sons_deg"
+
+s10 linestyle 0
+s10 symbol 6
+s10 symbol color 9
+s10 legend "free_deg"
+
+s11 linestyle 2
+s11 legend "p_to_fath"
+
+# The fits
+copy s11 to s12
+s12 linestyle 4
+s12 legend ""
+s12 line linewidth 2.5
+fit formula "y = a0*(x^a1)"
+fit with 2 parameters
+fit prec 1e-5
+a0 = 1
+a0 constraints off
+a1 = 1
+a1 constraints off
+
+echo ""; echo ""; echo "#####################";
+echo "Urns Number"; echo "#####################"; echo "";
+nonlfit(s0,250)
+s12.y = a0*(s12.x^a1)
+
+echo ""; echo ""; echo "#####################";
+echo "Full Urns"; echo "#####################"; echo "";
+copy s12 to s13
+nonlfit(s1,250)
+s13.y = a0*(s12.x^a1)
+
+echo ""; echo ""; echo "#####################";
+echo "Num of Fath"; echo "#####################"; echo "";
+copy s13 to s14
+nonlfit(s2,250)
+s14.y = a0*(s12.x^a1)
+
+echo ""; echo ""; echo "#####################";
+echo "Num of Sons"; echo "#####################"; echo "";
+copy s14 to s15
+nonlfit(s3,250)
+s15.y = a0*(s12.x^a1)
+
+echo ""; echo ""; echo "#####################";
+echo "Full Sons"; echo "#####################"; echo "";
+copy s15 to s16
+nonlfit(s4,250)
+s16.y = a0*(s12.x^a1)
+
+echo ""; echo ""; echo "#####################";
+echo "Num of Free"; echo "#####################"; echo "";
+copy s16 to s17
+nonlfit(s5,250)
+s17.y = a0*(s12.x^a1)
+
+echo ""; echo ""; echo "#####################";
+echo "Num of Full Free"; echo "#####################"; echo "";
+copy s17 to s18
+nonlfit(s6,250)
+s18.y = a0*(s12.x^a1)
+
+echo ""; echo ""; echo "#####################";
+echo "A(t)"; echo "#####################"; echo "";
+copy s18 to s22
+nonlfit(s7,250)
+s22.y = a0*(s12.x^a1)
+
+echo ""; echo ""; echo "#####################";
+echo "A(t) fathers"; echo "#####################"; echo "";
+copy s18 to s23
+nonlfit(s8,250)
+s23.y = a0*(s12.x^a1)
+
+echo ""; echo ""; echo "#####################";
+echo "P to father"; echo "#####################"; echo "";
+fit formula "y = a0"
+fit with 1 parameters
+fit prec 1e-5
+a0 = 1
+a0 constraints off
+copy s18 to s19
+nonlfit(s11,250)
+s19.y = a0
+
+
+legend 0.2, 0.8
+legend char size .5
+
+PRINT TO "Symm_Reinforce1_r04_n02_t000010000000_Run_00_connections.dat.eps"
+HARDCOPY DEVICE "eps"
+PRINT
+
+saveall "Symm_Reinforce1_r04_n02_t000010000000_Run_00_connections.dat.agr"
+
